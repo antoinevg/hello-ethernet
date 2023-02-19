@@ -1,26 +1,19 @@
 from amaranth import *
 
-from daqnet.ethernet.mac import MAC
-from daqnet.ethernet.ip import IPStack
 
-# - module: DomainGeneratorVersionOne -----------------------------------------
-#
-# This one borrows from LambdaSoC with the promise that I can just spec a sync_clk_freq
-#
-# Ref: https://github.com/lambdaconcept/lambdasoc/blob/master/lambdasoc/cores/pll/lattice_ecp5.py
-#
-# It will be deleted and when it is, remember to do a `pip uninstall lambdasoc`
+# - module: DomainGenerator ---------------------------------------------------
 
-from lambdasoc.cores.pll.lattice_ecp5 import PLL_LatticeECP5
 from amaranth.lib.cdc import ResetSynchronizer
+from car import EHXPLL
 
-class DomainGeneratorVersionOne(Elaboratable):
+class DomainGenerator(Elaboratable):
     def __init__(self, *, sync_clk_freq):
         self.sync_clk_freq = sync_clk_freq
 
     def elaborate(self, platform):
         m = Module()
 
+        # TODO generate a separate domain for "eth"
         m.domains += [
             ClockDomain("_ref", reset_less=platform.default_rst is None, local=True),
             ClockDomain("sync"),
@@ -31,35 +24,24 @@ class DomainGeneratorVersionOne(Elaboratable):
             m.d.comb += ResetSignal("_ref").eq(platform.request(platform.default_rst, 0).i)
 
         if isinstance(platform, ULX3S_85F_Platform):
-            sync_pll_params = PLL_LatticeECP5.Parameters(
+            m.submodules.sync_pll = sync_pll = EHXPLL(
                 i_domain     = "_ref",
-                i_freq       = platform.default_clk_frequency,
                 i_reset_less = platform.default_rst is None,
                 o_domain     = "sync",
+                i_freq       = platform.default_clk_frequency,
                 o_freq       = self.sync_clk_freq,
             )
-            m.submodules.sync_pll = sync_pll = PLL_LatticeECP5(sync_pll_params)
         else:
             assert False
 
         if platform.default_rst is not None:
-            sync_pll_arst = ~sync_pll.locked | ResetSignal("_ref")
+            sync_pll_arst = ~sync_pll.o_locked | ResetSignal("_ref")
         else:
-            sync_pll_arst = ~sync_pll.locked
+            sync_pll_arst = ~sync_pll.o_locked
 
         m.submodules += ResetSynchronizer(sync_pll_arst, domain="sync")
 
         return m
-
-# - module: DomainGeneratorVersionTwo -----------------------------------------
-#
-# Combine Luna (pll.py) + LambdaSoC ?
-
-
-
-# - module: DomainGeneratorVersionThree ---------------------------------------
-#
-# Try combine above with daqnet for something bespoke and cool
 
 
 # - module: Blinky ------------------------------------------------------------
@@ -91,6 +73,10 @@ class Blinky(Elaboratable):
 
 # - module: Top ---------------------------------------------------------------
 
+from daqnet.ethernet.mac import MAC
+from daqnet.ethernet.ip import IPStack
+
+
 class Top(Elaboratable):
     def __init__(self):
         # configuration
@@ -110,25 +96,24 @@ class Top(Elaboratable):
         m = Module()
 
         # clock domain
-        m.submodules.car = DomainGeneratorVersionOne(sync_clk_freq = 100_000_000)
+        m.submodules.car = DomainGenerator(sync_clk_freq = 100_000_000)
 
         # resources
         if platform is not None:
-            self.leds = Cat(platform.request("led", i) for i in range(3))
+            self.leds = Cat(platform.request("led", i) for i in range(6))
             self.rmii = platform.request("rmii", 0)
             self.mdio = platform.request("mdio", 0)
             self.phy  = platform.request("phy", 0)
             self.button_pwr = platform.request("button_pwr", 0)
 
         # Ethernet MAC
-        # phy.rst -> leds.1, phy.led -> leds.2
         mac = MAC(100e6, 0, self.mac_addr, self.rmii, self.mdio, self.phy.rst, self.leds[1])
         m.d.comb += [
             # Explicitly zero unused inputs in MAC
             mac.phy_reset.eq(0),
         ]
 
-        # TODO get rid of
+        # Daqnet "User" endpoint
         from daqnet.user import User
         user = User()
 
@@ -155,7 +140,6 @@ class Top(Elaboratable):
             user.transmit_ready.eq(ipstack.user_ready),
             user.packet_received.eq(ipstack.user_rx),
         ]
-
 
         # connections
         m.d.comb += [
@@ -200,7 +184,6 @@ if __name__ == "__main__":
         ),
         Resource("phy", 0,
             Subsignal("rst",     Pins("9+",  conn=("gpio", 0), dir="o")),
-            #Subsignal("led",     Pins("9+",  conn=("gpio", 0), dir="o")),
         ),
         # alias these for daqnet's User module
         Resource("user_led", 0, Pins("E1", dir="o"), Attrs(IO_TYPE="LVCMOS33", DRIVE="4")),
@@ -208,10 +191,4 @@ if __name__ == "__main__":
     ])
 
     top = Top()
-    #platform.build(top, do_program=False)
     platform.build(top, do_program=True)
-
-
-
-# din  -> w_data
-# dout -> r_data
